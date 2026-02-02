@@ -1,0 +1,110 @@
+set -x
+
+WORKSPACE=$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")")
+echo "Using workspace: $WORKSPACE"
+
+# Project and experiment name
+PROJECT_NAME="ctwa-reinforce-math500"
+EXPERIMENT_NAME="qwen2.5-1.5b-base-math500-acc-conciseness-clarity"
+
+# Reward function
+REWARD_PATH="['$WORKSPACE/verl/utils/reward_score/multiobjective_math/accuracy.py','$WORKSPACE/verl/utils/reward_score/multiobjective_math/conciseness.py','$WORKSPACE/verl/utils/reward_score/multiobjective_math/clarity.py']"
+WEIGHTS="[0.333,0.333,0.334]"
+
+# Data
+TRAIN_FILES="$WORKSPACE/data/math500/train.parquet"
+TEST_FILES="$WORKSPACE/data/math500/test.parquet"
+
+# Model
+INIT_MODEL="Qwen/Qwen2.5-1.5B"
+
+# Algorithm Hyperparameters
+LAMBDA_LR=0.05
+COV_TARGETS="[0.15,0.08,0.08]"
+W_AGG="mean"
+GLOBAL_METRICS=False
+
+# Training hyperparameters
+ADV_ESTIMATOR="reinforce_plus_plus"
+LR_SCHEDULER="constant"
+LEARNING_RATE="1e-6"
+GPUS_PER_NODE=4
+NUM_NODES=1
+MICRO_BATCH_SIZE_PER_GPU=16
+ROLLOUT_N=16
+ENTROPY_COEFF=0
+
+EPOCH=90
+
+# for reinforce only
+# for grpo, we set to default values
+CLIP_RATIO_C=100 # set high to disable clipping, default 3
+CLIP_RATIO_LOW=100 # set high to disable clipping, default 0.2
+CLIP_RATIO_HIGH=100 # set high to disable clipping, default 0.2
+
+# --------------------------
+
+# export NCCL_SOCKET_IFNAME=eth0
+# export VLLM_ATTENTION_BACKEND=XFORMERS
+# export RAY_DEDUP_LOGS=0
+
+export NCCL_DEBUG=INFO
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=8265
+export NCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export NCCL_IB_DISABLE=1
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+python3 -m verl.trainer.main_ppo_multiobjective \
+    algorithm.adv_estimator=$ADV_ESTIMATOR \
+    algorithm.weighting_method=covariance \
+    algorithm.covariance.lambda_lr=$LAMBDA_LR \
+    algorithm.covariance.cov_targets=$COV_TARGETS \
+    algorithm.covariance.w_agg=$W_AGG \
+    algorithm.covariance.global_metrics=$GLOBAL_METRICS \
+    data.train_files=$TRAIN_FILES \
+    data.val_files=$TEST_FILES \
+    data.train_batch_size=32 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=1024 \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    reward_model.reward_manager=multiobjective \
+    custom_reward_function.path=$REWARD_PATH \
+    custom_reward_function.weights=$WEIGHTS \
+    actor_rollout_ref.model.path=$INIT_MODEL \
+    actor_rollout_ref.actor.optim.warmup_style=$LR_SCHEDULER \
+    actor_rollout_ref.actor.optim.lr=$LEARNING_RATE \
+    actor_rollout_ref.actor.clip_ratio_c=$CLIP_RATIO_C \
+    actor_rollout_ref.actor.clip_ratio_low=$CLIP_RATIO_LOW \
+    actor_rollout_ref.actor.clip_ratio_high=$CLIP_RATIO_HIGH \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=$ENTROPY_COEFF \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.n=$ROLLOUT_N \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.use_kl_in_reward=False \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name=$PROJECT_NAME \
+    trainer.experiment_name=$EXPERIMENT_NAME \
+    trainer.n_gpus_per_node=$GPUS_PER_NODE \
+    trainer.nnodes=$NUM_NODES \
+    trainer.save_freq=-1 \
+    trainer.test_freq=5 \
+    trainer.default_local_dir=$WORKSPACE/checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME \
+    trainer.total_epochs=$EPOCH $@

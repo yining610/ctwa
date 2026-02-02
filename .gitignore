@@ -1,0 +1,14 @@
+__pycache__/
+outputs/
+
+*.o*
+
+.env
+
+wandb/
+
+results/
+
+test.ipynb
+
+figures/
