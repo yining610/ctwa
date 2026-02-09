@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>TL;DR: We analyze cross-objective interference in multi-objective alignment of LLMs and introduce an approach to mitigate it.</b><br>
-  <a href=""><b>Paper on arXiv</b></a>
+  <a href="https://arxiv.org/abs/2602.06869"><b>Paper on arXiv</b></a>
 </p>
 
 ## Folder Structure
