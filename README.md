@@ -40,3 +40,16 @@ We provide the bash script of each algorithm in the `examples/` directory. Takin
 ```
 bash examples/ctwa_trainer/run_covariance_math.sh
 ```
+## Citation
+If you use our code, please cite the following paper:
+```
+@misc{lu2026uncoveringcrossobjectiveinterferencemultiobjective,
+      title={Uncovering Cross-Objective Interference in Multi-Objective Alignment}, 
+      author={Yining Lu and Meng Jiang},
+      year={2026},
+      eprint={2602.06869},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2602.06869}, 
+}
+```
