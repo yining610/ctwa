@@ -1,10 +1,11 @@
 # Uncovering Cross-Objective Interference in Multi-Objective Alignment
 
 <p align="center">
-  <img src="https://img.shields.io/github/stars/yining610/ctwa?style=social"/>
-  <img src="https://img.shields.io/github/forks/yining610/ctwa?style=social"/>
-  <img src="https://img.shields.io/github/license/yining610/ctwa?style=flat&v=2"/>
+  <img src="https://img.shields.io/github/stars/yining610/ctwa?style=social&v=20260209"/>
+  <img src="https://img.shields.io/github/forks/yining610/ctwa?style=social&v=20260209"/>
+  <img src="https://img.shields.io/github/license/yining610/ctwa?style=flat&v=20260209"/>
 </p>
+
 
 <p align="center">
   <b>TL;DR: We analyze cross-objective interference in multi-objective alignment of LLMs and introduce an approach to mitigate it.</b><br>
