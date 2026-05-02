@@ -12,6 +12,10 @@
   <a href="https://arxiv.org/abs/2602.06869"><b>Paper on arXiv</b></a>
 </p>
 
+<p align="center">
+  <img src="results.png" alt="Main results" width="1000" />
+</p>
+
 ## Folder Structure
 ```
 scripts/     // callable scripts for data preprocessing
@@ -26,7 +30,7 @@ We use the `Dockerfile` to build the environment. For more setup instructions, p
 We use Wandb to log experiments, so please log in before running them.
 
 ## Experiment
-We implemented a total of **8** scalarization algorithms from MOO and MTL, including our CTWA. They are:
+We implemented a total of **9** scalarization algorithms from MOO and MTL, including our CTWA. They are:
 1. CTWA (ours): `verl/trainer/ppo/ray_trainer_covariance.py`
 2. [Dynamic Reweighting](https://arxiv.org/abs/2509.11452): `verl/trainer/ppo/ray_trainer_dynamic.py`
 3. [GradNorm](https://arxiv.org/abs/1711.02257): `verl/trainer/ppo/ray_trainer_gradnorm.py`
@@ -35,6 +39,9 @@ We implemented a total of **8** scalarization algorithms from MOO and MTL, inclu
 6. Linear: `verl/trainer/ppo/ray_trainer_multiobjective.py`
 7. [PAMA](https://arxiv.org/abs/2508.07768): `verl/trainer/ppo/ray_trainer_pama.py`
 8. [Tchebycheff Scalarization](https://link.springer.com/chapter/10.1007/978-3-642-87563-2_5): `verl/trainer/ppo/ray_trainer_tchebycheff.py`
+9. [Smoothed Tchebycheff Scalarization](https://openreview.net/pdf?id=UhmEdfAk46) `verl/trainer/ppo/ray_trainer_smooth_tchebycheff.py`
+
+Note: In our paper, we report results for Smoothed Tchebycheff Scalarization rather than the classic Tchebycheff Scalarization because it performs better. We open-source both methods to support reproducibility and future research.
 
 We provide the bash script of each algorithm in the `examples/` directory. Taking an example of training Qwen2.5-1.5B-Base using CTWA:
 ```

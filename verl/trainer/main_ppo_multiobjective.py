@@ -311,6 +311,9 @@ class TaskRunner:
         elif config.algorithm.weighting_method == "tchebycheff":
             from verl.trainer.ppo.ray_trainer_tchebycheff import TchebycheffRayPPOTrainer
             trainer_cls = TchebycheffRayPPOTrainer
+        elif config.algorithm.weighting_method == "smooth_tchebycheff":
+            from verl.trainer.ppo.ray_trainer_smooth_tchebycheff import SmoothTchebycheffRayPPOTrainer
+            trainer_cls = SmoothTchebycheffRayPPOTrainer
         elif config.algorithm.weighting_method == "dynamic":
             from verl.trainer.ppo.ray_trainer_dynamic import DynamicRayPPOTrainer
             trainer_cls = DynamicRayPPOTrainer
