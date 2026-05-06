@@ -232,3 +232,147 @@ def compute_mgda_weights(grad_mat: torch.Tensor) -> torch.Tensor:
     if not torch.isfinite(w).all():
         w = torch.full((obj_count,), 1.0 / obj_count, device=device, dtype=dtype)
     return w
+
+
+def compute_nash_mtl_weights(
+    J: torch.Tensor,
+    init_alpha: torch.Tensor | None = None,
+    optim_niter: int = 20,
+    lr: float = 0.1,
+    eps: float = 1e-8,
+    max_weight: float = 1e3,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute Nash-MTL bargaining weights from per-objective gradients.
+
+    Args:
+        J: Per-objective gradient matrix from the paper, with one task/objective
+            gradient per row. Shape: (num_objectives, num_parameters).
+
+    The paper solves a small sequential convex program over alpha using the
+    Gram matrix G = JJ^T. This function implements the same sequential
+    linearization of phi(alpha) in torch and approximately solves each convex
+    subproblem with a differentiable penalty for the original log constraints.
+    """
+
+    obj_count = J.shape[0]
+    device = J.device
+    dtype = J.dtype
+
+    if obj_count == 1:
+        return torch.ones(1, device=device, dtype=dtype), {
+            "nash_mtl/gram_norm": 0.0,
+            "nash_mtl/residual_norm": 0.0,
+        }
+
+    # Official Nash-MTL normalizes the task Gram matrix G = JJ^T.
+    G_raw = J @ J.T
+    G_norm = torch.linalg.matrix_norm(G_raw).clamp_min(eps)
+    G = G_raw / G_norm
+
+    if init_alpha is None or init_alpha.numel() != obj_count or not torch.isfinite(init_alpha).all():
+        alpha_init = torch.ones(obj_count, device=device, dtype=dtype)
+    else:
+        alpha_init = init_alpha.to(device=device, dtype=dtype).clamp(min=eps, max=max_weight)
+
+    alpha = alpha_init.detach()
+    torch_subproblem_niter = 100
+    constraint_penalty = 100.0
+    max_constraint_violation = torch.tensor(0.0, device=device, dtype=dtype)
+
+    def _calc_phi_alpha_linearization(alpha_var: torch.Tensor, prvs_alpha: torch.Tensor) -> torch.Tensor:
+        """Torch equivalent of Nash-MTL's `_calc_phi_alpha_linearization`."""
+
+        G_prvs_alpha = (G @ prvs_alpha).clamp_min(eps)
+        prvs_phi_tag = (1.0 / prvs_alpha) + ((1.0 / G_prvs_alpha) @ G)
+        return torch.dot(prvs_phi_tag.detach(), alpha_var - prvs_alpha)
+
+    def _constraint(alpha_var: torch.Tensor) -> torch.Tensor:
+        """Original non-linear Nash-MTL constraint: -phi_i(alpha) <= 0."""
+
+        G_alpha = (G @ alpha_var).clamp_min(eps)
+        return -torch.log(alpha_var * G_norm) - torch.log(G_alpha)
+
+    def _stop_criteria(alpha_t: torch.Tensor, alpha_next: torch.Tensor) -> bool:
+        """Same stopping checks as the reference implementation."""
+
+        stationarity = torch.linalg.vector_norm(G @ alpha_t - 1.0 / (alpha_t + 1e-10)).item()
+        update_norm = torch.linalg.vector_norm(alpha_next - alpha_t).item()
+        return stationarity < 1e-3 or update_norm < 1e-6
+
+    def _solve_torch_subproblem(alpha_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Approximate one CVXPY/ECOS subproblem from the original solver.
+
+        Reference objective:
+            min_alpha sum_i beta_i(alpha) + \tilde{phi}_tau(alpha) / ||G_raw||
+
+        Reference constraints:
+            -log(alpha_i * ||G_raw||) - log(beta_i(alpha)) <= 0
+            alpha_i > 0
+
+        We keep the same objective and constraints, but enforce constraints
+        through a squared ReLU penalty so the solve stays torch-only.
+        """
+
+        alpha_var = alpha_t.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([alpha_var], lr=lr)
+        max_violation = torch.tensor(0.0, device=device, dtype=dtype)
+
+        for _ in range(torch_subproblem_niter):
+            optimizer.zero_grad()
+            alpha_pos = alpha_var.clamp(min=eps, max=max_weight)
+            beta = (G @ alpha_pos).clamp_min(eps)
+
+            phi_alpha = _calc_phi_alpha_linearization(alpha_pos, alpha_t)
+            objective = torch.sum(beta) + phi_alpha / G_norm
+
+            constraint = _constraint(alpha_pos)
+            constraint_violation = torch.relu(constraint)
+            max_violation = torch.maximum(max_violation, constraint_violation.max().detach())
+            penalty = constraint_penalty * torch.sum(constraint_violation.square())
+
+            loss = objective + penalty
+            if not torch.isfinite(loss):
+                break
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                alpha_var.clamp_(min=eps, max=max_weight)
+
+        return alpha_var.detach().clamp(min=eps, max=max_weight), max_violation
+
+    def solve_optimization(alpha_start: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Torch-only version of Nash-MTL's `solve_optimization` loop."""
+
+        alpha_t = alpha_start
+        max_violation = torch.tensor(0.0, device=device, dtype=dtype)
+
+        for _ in range(max(1, optim_niter)):
+            prvs_alpha = alpha_t.detach().clamp(min=eps, max=max_weight)
+            alpha_next, subproblem_violation = _solve_torch_subproblem(prvs_alpha)
+            max_violation = torch.maximum(max_violation, subproblem_violation)
+
+            if _stop_criteria(prvs_alpha, alpha_next):
+                alpha_t = alpha_next
+                break
+
+            alpha_t = alpha_next
+
+        return alpha_t, max_violation
+
+    alpha, max_constraint_violation = solve_optimization(alpha)
+
+    beta_raw = (G_raw @ alpha).clamp_min(eps)
+    residual = alpha * beta_raw - 1.0
+
+    if not torch.isfinite(alpha).all():
+        alpha = torch.ones(obj_count, device=device, dtype=dtype)
+        residual = torch.zeros_like(alpha)
+
+    metrics = {
+        "nash_mtl/gram_norm": float(G_norm.detach().item()),
+        "nash_mtl/residual_norm": float(torch.linalg.vector_norm(residual).detach().item()),
+        "nash_mtl/max_residual_abs": float(torch.max(torch.abs(residual)).detach().item()),
+        "nash_mtl/max_constraint_violation": float(max_constraint_violation.detach().item()),
+    }
+    return alpha, metrics

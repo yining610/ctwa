@@ -39,7 +39,9 @@ We implemented a total of **9** scalarization algorithms from MOO and MTL, inclu
 6. Linear: `verl/trainer/ppo/ray_trainer_multiobjective.py`
 7. [PAMA](https://arxiv.org/abs/2508.07768): `verl/trainer/ppo/ray_trainer_pama.py`
 8. [Tchebycheff Scalarization](https://link.springer.com/chapter/10.1007/978-3-642-87563-2_5): `verl/trainer/ppo/ray_trainer_tchebycheff.py`
-9. [Smoothed Tchebycheff Scalarization](https://openreview.net/pdf?id=UhmEdfAk46) `verl/trainer/ppo/ray_trainer_smooth_tchebycheff.py`
+9. [Smoothed Tchebycheff Scalarization](https://openreview.net/pdf?id=UhmEdfAk46): `verl/trainer/ppo/ray_trainer_smooth_tchebycheff.py`
+10. [Nash-MTL](https://arxiv.org/abs/2202.01017): `verl/trainer/ppo/ray_trainer_nash_mtl.py`
+11. [FAMO](https://arxiv.org/abs/2306.03792): `verl/trainer/ppo/ray_trainer_famo.py`
 
 Note: In our paper, we report results for Smoothed Tchebycheff Scalarization rather than the classic Tchebycheff Scalarization because it performs better. We open-source both methods to support reproducibility and future research.
 

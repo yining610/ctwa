@@ -117,6 +117,15 @@ class ActorConfig(BaseConfig):
     norm_grad_norm: bool = False
     gradnorm_alpha: float = 1.5
     gradnorm_lr: float = 0.025
+    nash_mtl_optim_niter: int = 20
+    nash_mtl_lr: float = 0.1
+    nash_mtl_eps: float = 1e-8
+    nash_mtl_max_weight: float = 1000.0
+    famo_gamma: float = 1e-5
+    famo_w_lr: float = 0.025
+    famo_eps: float = 1e-8
+    famo_min_losses: Optional[list[float]] = None
+    famo_min_loss_margin: float = 1.0
     ppo_epochs: int = 1
     shuffle: bool = False
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)

@@ -83,6 +83,33 @@ gradnorm_alpha: ${oc.select:algorithm.gradnorm.gradnorm_alpha, 1.5}
 # GradNorm learning rate for task weights, forwarded from algorithm config.
 gradnorm_lr: ${oc.select:algorithm.gradnorm.gradnorm_lr, 0.025}
 
+# Nash-MTL solver iterations, forwarded from algorithm config.
+nash_mtl_optim_niter: ${oc.select:algorithm.nash_mtl.optim_niter, 20}
+
+# Nash-MTL torch subproblem solver learning rate, forwarded from algorithm config.
+nash_mtl_lr: ${oc.select:algorithm.nash_mtl.lr, 0.1}
+
+# Nash-MTL numerical epsilon, forwarded from algorithm config.
+nash_mtl_eps: ${oc.select:algorithm.nash_mtl.eps, 1e-8}
+
+# Nash-MTL maximum per-objective bargaining weight, forwarded from algorithm config.
+nash_mtl_max_weight: ${oc.select:algorithm.nash_mtl.max_weight, 1000.0}
+
+# FAMO task-logit Adam weight decay, forwarded from algorithm config.
+famo_gamma: ${oc.select:algorithm.famo.gamma, 1e-5}
+
+# FAMO task-logit Adam learning rate, forwarded from algorithm config.
+famo_w_lr: ${oc.select:algorithm.famo.w_lr, 0.025}
+
+# FAMO numerical epsilon, forwarded from algorithm config.
+famo_eps: ${oc.select:algorithm.famo.eps, 1e-8}
+
+# Optional FAMO minimum losses, forwarded from algorithm config.
+famo_min_losses: ${oc.select:algorithm.famo.min_losses, null}
+
+# FAMO fallback margin used when PPO surrogate losses need an inferred lower bound.
+famo_min_loss_margin: ${oc.select:algorithm.famo.min_loss_margin, 1.0}
+
 # Truncated Importance Sampling (TIS): https://fengyao.notion.site/off-policy-rl
 # the truncation value C of truncated Importance Sampling (-1 for disable TIS)
 tis_imp_ratio_cap: -1

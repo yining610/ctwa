@@ -22,6 +22,7 @@ import os
 from functools import partial
 import math
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -37,7 +38,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.workers.actor.core_algos import compute_mgda_weights, compute_ctwa_stats
+from verl.workers.actor.core_algos import compute_mgda_weights, compute_ctwa_stats, compute_nash_mtl_weights
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -762,6 +763,369 @@ class DataParallelPPOActor(BasePPOActor):
                     flat_grad_concat=weighted_flat_grad, num_params_per_layer=num_params_per_layer
                 )
                 append_to_dict(metrics, grad_metrics)
+
+        return metrics
+
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_nash_mtl(self, data: DataProto):
+        self.actor_module.train()
+
+        temperature = data.meta_info["temperature"]
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages_multi",
+        ]
+        if self.config.use_kl_loss:
+            select_keys.append("ref_log_prob")
+        if self.config.tis_imp_ratio_cap > 0:
+            assert "rollout_log_probs" in data.batch.keys(), (
+                "Truncated Importance Sampling (TIS) requires to configure "
+                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
+                "and is not currently supported in Server mode (agent loop)."
+            )
+            select_keys.append("rollout_log_probs")
+
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+
+        num_params_per_layer = self.get_num_parameters()
+        num_params = int(num_params_per_layer.sum().item())
+        print(f"[Nash-MTL] Number of parameters on replica {get_device_id()}: {num_params}")
+
+        entropy_coeff = self.config.entropy_coeff
+        loss_agg_mode = self.config.loss_agg_mode
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+        nash_optim_niter = int(self.config.get("nash_mtl_optim_niter", 20))
+        nash_lr = float(self.config.get("nash_mtl_lr", 0.1))
+        nash_eps = float(self.config.get("nash_mtl_eps", 1e-8))
+        nash_max_weight = float(self.config.get("nash_mtl_max_weight", 1e3))
+
+        metrics = {}
+        for _ in range(self.config.ppo_epochs):
+            for _, mini_batch in enumerate(mini_batches):
+                if self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                else:
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                advantages_multi_mb = mini_batch.batch["advantages_multi"]
+                num_objectives = advantages_multi_mb.shape[-1]
+                grad_mat = torch.zeros((num_objectives, num_params), dtype=torch.float32, device=get_device_id())
+
+                for objective_idx in range(num_objectives):
+                    self.actor_optimizer.zero_grad()
+
+                    for micro_batch in micro_batches:
+                        micro_batch = micro_batch.to(get_device_id())
+                        micro_batch_metrics = {}
+                        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                        response_mask = model_inputs["response_mask"]
+                        old_log_prob = model_inputs["old_log_probs"]
+                        rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
+                        advantages_multi = model_inputs["advantages_multi"]
+                        advantages_s = advantages_multi[..., objective_idx]
+
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
+                        calculate_entropy = entropy_coeff != 0
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
+
+                        old_log_prob_local = log_prob.detach() if on_policy else old_log_prob
+
+                        pg_loss_s, pg_clipfrac_s, ppo_kl_s, pg_clipfrac_lower_s = policy_loss_fn(
+                            old_log_prob=old_log_prob_local,
+                            log_prob=log_prob,
+                            advantages=advantages_s,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
+
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss_s = pg_loss_s - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss_s = pg_loss_s
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss_s = policy_loss_s + kl_loss * self.config.kl_loss_coef
+
+                        loss_s = policy_loss_s * loss_scale_factor
+                        loss_s.backward()
+
+                        micro_batch_metrics.update(
+                            {
+                                f"nash_mtl/pg_loss_{objective_idx}": pg_loss_s.detach().item() * loss_scale_factor,
+                                f"nash_mtl/pg_clipfrac_{objective_idx}": pg_clipfrac_s.detach().item(),
+                                f"nash_mtl/ppo_kl_{objective_idx}": ppo_kl_s.detach().item(),
+                                f"nash_mtl/pg_clipfrac_lower_{objective_idx}": pg_clipfrac_lower_s.detach().item(),
+                            }
+                        )
+                        append_to_dict(metrics, micro_batch_metrics)
+
+                    flat_chunks = []
+                    for p in self.actor_module.parameters():
+                        flat_chunks.append(p.grad.detach().to(torch.float32).view(-1))
+                    grad_mat[objective_idx] = torch.cat(flat_chunks, dim=0)
+
+                if self.config.norm_grad_norm:
+                    row_norms = grad_mat.norm(dim=1, keepdim=True)
+                    row_norms = torch.where(row_norms > 0, row_norms, torch.ones_like(row_norms))
+                    grad_mat = grad_mat / row_norms
+
+                init_alpha = getattr(self, "_nash_mtl_alpha", None)
+                nash_weights, nash_metrics = compute_nash_mtl_weights(
+                    J=grad_mat,
+                    init_alpha=init_alpha,
+                    optim_niter=nash_optim_niter,
+                    lr=nash_lr,
+                    eps=nash_eps,
+                    max_weight=nash_max_weight,
+                )
+                self._nash_mtl_alpha = nash_weights.detach()
+
+                append_to_dict(metrics, {f"nash_mtl/weight_{s}": float(nash_weights[s].item()) for s in range(num_objectives)})
+                append_to_dict(metrics, nash_metrics)
+
+                weighted_flat_grad = nash_weights @ grad_mat
+                grad_metrics = self.apply_flat_gradients(
+                    flat_grad_concat=weighted_flat_grad, num_params_per_layer=num_params_per_layer
+                )
+                append_to_dict(metrics, grad_metrics)
+
+        return metrics
+
+    def _ensure_famo_state(self, num_objectives: int, device: torch.device, losses: torch.Tensor):
+        initialized = getattr(self, "_famo_initialized", False)
+        if initialized and self._famo_w.numel() == num_objectives and self._famo_w.device == device:
+            return
+
+        famo_gamma = float(self.config.get("famo_gamma", 1e-5))
+        famo_w_lr = float(self.config.get("famo_w_lr", 0.025))
+        famo_min_losses = self.config.get("famo_min_losses", None)
+        famo_min_loss_margin = float(self.config.get("famo_min_loss_margin", 1.0))
+
+        self._famo_w = torch.zeros(num_objectives, device=device, requires_grad=True)
+        self._famo_w_opt = torch.optim.Adam([self._famo_w], lr=famo_w_lr, weight_decay=famo_gamma)
+        if famo_min_losses is None:
+            self._famo_min_losses = losses.detach().to(device=device) - famo_min_loss_margin
+        else:
+            self._famo_min_losses = torch.as_tensor(famo_min_losses, device=device, dtype=losses.dtype)
+            if self._famo_min_losses.numel() != num_objectives:
+                raise ValueError(
+                    f"famo_min_losses must have {num_objectives} values, got {self._famo_min_losses.numel()}"
+                )
+        self._famo_initialized = True
+
+    def _keep_famo_losses_above_min(self, losses: torch.Tensor):
+        famo_eps = float(self.config.get("famo_eps", 1e-8))
+        famo_min_loss_margin = float(self.config.get("famo_min_loss_margin", 1.0))
+        with torch.no_grad():
+            too_low = losses.detach() - self._famo_min_losses <= famo_eps
+            if torch.any(too_low):
+                self._famo_min_losses = torch.where(
+                    too_low,
+                    losses.detach() - famo_min_loss_margin,
+                    self._famo_min_losses,
+                )
+
+    def _compute_famo_weighted_loss(self, losses: torch.Tensor):
+        famo_eps = float(self.config.get("famo_eps", 1e-8))
+        self._keep_famo_losses_above_min(losses)
+        z = F.softmax(self._famo_w, dim=-1)
+        d = losses - self._famo_min_losses + famo_eps
+        c = (z / d).sum().detach()
+        loss = (d.log() * z / c).sum()
+        return loss, z.detach(), d.detach()
+
+    def _update_famo_weights(self, prev_loss: torch.Tensor, curr_loss: torch.Tensor):
+        famo_eps = float(self.config.get("famo_eps", 1e-8))
+        self._keep_famo_losses_above_min(prev_loss)
+        self._keep_famo_losses_above_min(curr_loss)
+        delta = (prev_loss - self._famo_min_losses + famo_eps).log() - (
+            curr_loss - self._famo_min_losses + famo_eps
+        ).log()
+
+        with torch.enable_grad():
+            z = F.softmax(self._famo_w, dim=-1)
+            (w_grad,) = torch.autograd.grad(z, self._famo_w, grad_outputs=delta.detach())
+            self._famo_w_opt.zero_grad()
+            self._famo_w.grad = w_grad
+            self._famo_w_opt.step()
+
+        return delta.detach(), F.softmax(self._famo_w.detach(), dim=-1)
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_famo(self, data: DataProto):
+        self.actor_module.train()
+
+        temperature = data.meta_info["temperature"]
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages_multi",
+        ]
+        if self.config.use_kl_loss:
+            select_keys.append("ref_log_prob")
+        if self.config.tis_imp_ratio_cap > 0:
+            assert "rollout_log_probs" in data.batch.keys(), (
+                "Truncated Importance Sampling (TIS) requires to configure "
+                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
+                "and is not currently supported in Server mode (agent loop)."
+            )
+            select_keys.append("rollout_log_probs")
+
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+        entropy_coeff = self.config.entropy_coeff
+        calculate_entropy = entropy_coeff != 0
+        loss_agg_mode = self.config.loss_agg_mode
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+        def _loss_vec_from_micro_batch(micro_batch: DataProto) -> tuple[torch.Tensor, dict[str, float]]:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            response_mask = model_inputs["response_mask"]
+            old_log_prob = model_inputs["old_log_probs"]
+            rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
+            advantages_multi = model_inputs["advantages_multi"]
+
+            entropy, log_prob = self._forward_micro_batch(
+                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+            )
+            losses = []
+            micro_metrics = {}
+            for objective_idx in range(advantages_multi.shape[-1]):
+                pg_loss_s, pg_clipfrac_s, ppo_kl_s, pg_clipfrac_lower_s = policy_loss_fn(
+                    old_log_prob=old_log_prob,
+                    log_prob=log_prob,
+                    advantages=advantages_multi[..., objective_idx],
+                    response_mask=response_mask,
+                    loss_agg_mode=loss_agg_mode,
+                    config=self.config,
+                    rollout_log_probs=rollout_log_probs,
+                )
+
+                if entropy_coeff != 0:
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    policy_loss_s = pg_loss_s - entropy_loss * entropy_coeff
+                else:
+                    policy_loss_s = pg_loss_s
+
+                if self.config.use_kl_loss:
+                    ref_log_prob = model_inputs["ref_log_prob"]
+                    kld = kl_penalty(
+                        logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                    )
+                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    policy_loss_s = policy_loss_s + kl_loss * self.config.kl_loss_coef
+
+                losses.append(policy_loss_s)
+                micro_metrics.update(
+                    {
+                        f"famo/pg_loss_{objective_idx}": pg_loss_s.detach().item(),
+                        f"famo/pg_clipfrac_{objective_idx}": pg_clipfrac_s.detach().item(),
+                        f"famo/ppo_kl_{objective_idx}": ppo_kl_s.detach().item(),
+                        f"famo/pg_clipfrac_lower_{objective_idx}": pg_clipfrac_lower_s.detach().item(),
+                    }
+                )
+
+            return torch.stack(losses), micro_metrics
+
+        metrics = {}
+        for _ in range(self.config.ppo_epochs):
+            for _, mini_batch in enumerate(mini_batches):
+                if self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                else:
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                num_objectives = mini_batch.batch["advantages_multi"].shape[-1]
+                device = get_device_id()
+                prev_loss_accum = torch.zeros(num_objectives, dtype=torch.float32, device=device)
+
+                self.actor_optimizer.zero_grad()
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(device)
+                    response_mask = micro_batch.batch["response_mask"]
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1 / self.gradient_accumulation
+
+                    loss_vec, micro_metrics = _loss_vec_from_micro_batch(micro_batch)
+                    self._ensure_famo_state(num_objectives, loss_vec.device, loss_vec.detach())
+                    famo_loss, weights, distances = self._compute_famo_weighted_loss(loss_vec)
+                    (famo_loss * loss_scale_factor).backward()
+                    prev_loss_accum += loss_vec.detach().to(torch.float32) * loss_scale_factor
+
+                    micro_metrics = {k: v * loss_scale_factor if k.startswith("famo/pg_loss_") else v for k, v in micro_metrics.items()}
+                    append_to_dict(metrics, micro_metrics)
+                    append_to_dict(metrics, {f"famo/weight_before_{s}": float(weights[s].item()) for s in range(num_objectives)})
+                    append_to_dict(metrics, {f"famo/distance_{s}": float(distances[s].item()) for s in range(num_objectives)})
+
+                grad_norm = self._optimizer_step()
+                append_to_dict(metrics, {"actor/grad_norm": float(grad_norm.detach().item())})
+                self.actor_optimizer.zero_grad()
+
+                curr_loss_accum = torch.zeros(num_objectives, dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    for micro_batch in micro_batches:
+                        micro_batch = micro_batch.to(device)
+                        response_mask = micro_batch.batch["response_mask"]
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
+                        curr_loss_vec, _ = _loss_vec_from_micro_batch(micro_batch)
+                        curr_loss_accum += curr_loss_vec.detach().to(torch.float32) * loss_scale_factor
+
+                loss_delta, weights_after = self._update_famo_weights(prev_loss_accum, curr_loss_accum)
+                append_to_dict(metrics, {f"famo/loss_before_{s}": float(prev_loss_accum[s].item()) for s in range(num_objectives)})
+                append_to_dict(metrics, {f"famo/loss_after_{s}": float(curr_loss_accum[s].item()) for s in range(num_objectives)})
+                append_to_dict(metrics, {f"famo/loss_delta_{s}": float(loss_delta[s].item()) for s in range(num_objectives)})
+                append_to_dict(metrics, {f"famo/weight_after_{s}": float(weights_after[s].item()) for s in range(num_objectives)})
 
         return metrics
 

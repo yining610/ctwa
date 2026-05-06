@@ -302,6 +302,12 @@ class TaskRunner:
         elif config.algorithm.weighting_method == "mgda":
             from verl.trainer.ppo.ray_trainer_mgda import MGDARayPPOTrainer
             trainer_cls = MGDARayPPOTrainer
+        elif config.algorithm.weighting_method == "nash_mtl":
+            from verl.trainer.ppo.ray_trainer_nash_mtl import NashMTLRayPPOTrainer
+            trainer_cls = NashMTLRayPPOTrainer
+        elif config.algorithm.weighting_method == "famo":
+            from verl.trainer.ppo.ray_trainer_famo import FAMORayPPOTrainer
+            trainer_cls = FAMORayPPOTrainer
         elif config.algorithm.weighting_method == "gradnorm":
             from verl.trainer.ppo.ray_trainer_gradnorm import GradNormRayPPOTrainer
             trainer_cls = GradNormRayPPOTrainer
